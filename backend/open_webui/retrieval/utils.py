@@ -1,7 +1,6 @@
 import logging
 import os
 from typing import Optional, Union
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -100,8 +99,6 @@ def get_doc(collection_name: str, user: UserModel = None):
         raise e
 
 
-import time
-
 def query_doc_with_hybrid_search(
     collection_name: str,
     collection_data,
@@ -109,44 +106,21 @@ def query_doc_with_hybrid_search(
     embedding_function,
     k: int,
     reranking_function,
+    k_reranker: int,
     r: float,
 ) -> dict:
     try:
-        total_start = time.time()
+        bm25_retriever = BM25Retriever.from_texts(
+            texts=collection_data.documents[0],
+            metadatas=collection_data.metadatas[0],
+        )
+        bm25_retriever.k = k
 
-        def create_bm25_retriever():
-            start = time.time()
-            retriever = BM25Retriever.from_texts(
-                texts=collection_data.documents[0],
-                metadatas=collection_data.metadatas[0],
-            )
-            retriever.k = k
-            elapsed = time.time() - start
-            log.info(f"BM25 retriever creation took {elapsed:.2f} seconds")
-            return retriever
-
-        def create_vector_retriever():
-            start = time.time()
-            retriever = VectorSearchRetriever(
-                collection_name=collection_name,
-                embedding_function=embedding_function,
-                top_k=k,
-            )
-            elapsed = time.time() - start
-            log.info(f"Vector retriever creation took {elapsed:.2f} seconds")
-            return retriever
-
-        # Execute retriever creation in parallel
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            bm25_future = executor.submit(create_bm25_retriever)
-            vector_future = executor.submit(create_vector_retriever)
-
-            # Get results from futures
-            bm25_retriever = bm25_future.result()
-            vector_search_retriever = vector_future.result()
-
-        total_elapsed = time.time() - total_start
-        log.info(f"Total retriever creation took {total_elapsed:.2f} seconds")
+        vector_search_retriever = VectorSearchRetriever(
+            collection_name=collection_name,
+            embedding_function=embedding_function,
+            top_k=k,
+        )
 
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, vector_search_retriever], weights=[0.5, 0.5]
@@ -154,7 +128,7 @@ def query_doc_with_hybrid_search(
 
         compressor = RerankCompressor(
             embedding_function=embedding_function,
-            top_n=k,
+            top_n=k_reranker,
             reranking_function=reranking_function,
             r_score=r,
         )
@@ -163,10 +137,7 @@ def query_doc_with_hybrid_search(
             base_compressor=compressor, base_retriever=ensemble_retriever
         )
 
-        total_start = time.time()
         collection_data = compression_retriever.invoke(query)
-        total_elapsed = time.time() - total_start
-        log.info(f"Compression_retriever for {collection_name}/query: {query} took {total_elapsed:.2f} seconds")
         collection_data = {
             "distances": [[d.metadata.get("score") for d in collection_data]],
             "documents": [[d.page_content for d in collection_data]],
@@ -213,13 +184,8 @@ def merge_and_sort_query_results(
         reverse = False
     else:
         reverse = True
-    
-    total_start = time.time()
-    # Pre-allocate combined data structure with estimated capacity
-    estimated_capacity = sum(len(data["documents"][0]) for data in query_results)
-    combined = []
-    combined.reserve(estimated_capacity) if hasattr(list, 'reserve') else None  
-    
+
+    combined = []    
     seen_hashes = set()
     
     # Process all results in a single pass
@@ -246,15 +212,10 @@ def merge_and_sort_query_results(
     
     combined.sort(key=lambda x: x[0], reverse=reverse)
     
-    # Truncate to top k
-    del combined[k:]
+    # Truncate to top k results
+    combined = combined[:k]
     
-    # Unzip the results using zip with * operator (more efficient than multiple list comprehensions)
-    sorted_distances, sorted_documents, sorted_metadatas = zip(*combined) if combined else ([], [], [])
-
-    total_elapsed = time.time() - total_start
-    log.info(f"Total merge_and_sort_query_results took {total_elapsed:.2f} seconds")
-
+    sorted_distances, sorted_documents, sorted_metadatas = map(list, zip(*combined))
     
     return {
         "distances": [list(sorted_distances)],
@@ -313,6 +274,7 @@ def query_collection_with_hybrid_search(
     embedding_function,
     k: int,
     reranking_function,
+    k_reranker: int,
     r: float,
 ) -> dict:
     results = []
@@ -326,7 +288,6 @@ def query_collection_with_hybrid_search(
             for collection_name in collection_names
         }
 
-        # Retrieve collection data
         for collection_name, future in future_results.items():
             try:
                 collection_data[collection_name] = future.result()
@@ -347,6 +308,7 @@ def query_collection_with_hybrid_search(
                 embedding_function=embedding_function,
                 k=k,
                 reranking_function=reranking_function,
+                k_reranker=k_reranker,
                 r=r,
             )
             return result, None
@@ -369,7 +331,7 @@ def query_collection_with_hybrid_search(
     if error and not results:
         raise Exception("Hybrid search failed for all collections. Using Non-hybrid search as fallback.")
 
-    return merge_and_sort_query_results(results, k=k)
+    return merge_and_sort_query_results(results, k=k_reranker)
 
 
 def get_embedding_function(
@@ -415,6 +377,7 @@ def get_sources_from_files(
     embedding_function,
     k,
     reranking_function,
+    k_reranker,
     r,
     hybrid_search,
     full_context=False,
@@ -531,6 +494,7 @@ def get_sources_from_files(
                                     embedding_function=embedding_function,
                                     k=k,
                                     reranking_function=reranking_function,
+                                    k_reranker=k_reranker,
                                     r=r,
                                 )
                             except Exception as e:
